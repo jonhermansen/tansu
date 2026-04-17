@@ -2,15 +2,18 @@
 name: ci
 permissions:
   contents: read
+  packages: write
 on:
   push:
     branches:
       - main
+      - dual-listener
     tags:
       - "v*"
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 env:
   REGISTRY: ghcr.io
   CLICOLOR: 1
@@ -228,7 +231,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{github.actor == 'shortishly'}}
+          push: ${{github.actor == 'shortishly' || github.actor == 'jonhermansen'}}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
   smoke:
