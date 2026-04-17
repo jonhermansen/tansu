@@ -322,7 +322,7 @@ where
                         self.sasl_config.clone()
                     )?;
 
-                    set.spawn(async move {
+                    let _handle = set.spawn(async move {
                         match service.serve(c, stream).await {
                             Err(Error::Io(ref io))
                                 if io.kind() == ErrorKind::UnexpectedEof
@@ -330,7 +330,7 @@ where
                                     || io.kind() == ErrorKind::ConnectionReset => {}
                             Err(error) => {
                                 error!(?error);
-                            },
+                            }
                             Ok(response) => {
                                 debug!(?response)
                             }
