@@ -214,28 +214,44 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
+        let primary_port = self.listener.port().unwrap_or(9092);
         let listener = TcpListener::bind(self.listener.host().map_or_else(
-            || {
-                SocketAddr::from((
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    self.listener.port().unwrap_or(9092),
-                ))
-            },
+            || SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), primary_port)),
             |host| {
-                let port = self.listener.port().unwrap_or(9092);
-                debug!(?host, port);
+                debug!(?host, primary_port);
 
                 match host {
-                    url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
-                        .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
-                    url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
-                    url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
+                    url::Host::Domain(domain) => {
+                        SocketAddr::from_str(&format!("{domain}:{primary_port}")).unwrap_or(
+                            SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), primary_port)),
+                        )
+                    }
+                    url::Host::Ipv4(ipv4_addr) => {
+                        SocketAddr::from((IpAddr::V4(ipv4_addr), primary_port))
+                    }
+                    url::Host::Ipv6(ipv6_addr) => {
+                        SocketAddr::from((IpAddr::V6(ipv6_addr), primary_port))
+                    }
                 }
             },
         ))
         .await
         .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
         .inspect_err(|err| error!(?err, %self.advertised_listener))?;
+
+        // Bind a secondary listener on port 9092 if the primary isn't already 9092.
+        // This allows both internal (kafka:9092) and external (localhost:9093) access.
+        let secondary_listener = if primary_port != 9092 {
+            TcpListener::bind(SocketAddr::from((
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                9092u16,
+            )))
+            .await
+            .inspect(|l| debug!(secondary_listener = ?l.local_addr().ok()))
+            .ok()
+        } else {
+            None
+        };
 
         let mut interval =
             time::interval(self.maintenance_interval.unwrap_or(Duration::from_mins(10)));
@@ -277,6 +293,55 @@ where
             }
 
             tokio::select! {
+                // Accept from secondary listener (port 9092) if it exists
+                Ok((stream, _addr)) = async {
+                    match &secondary_listener {
+                        Some(l) => l.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    stream.set_nodelay(true)?;
+
+                    let mut c = Context::default();
+                    let pb = if self.silent {
+                        None
+                    } else {
+                        let pb = m.add(ProgressBar::new_spinner());
+                        pb.set_style(spinner_style.clone());
+                        pb.set_prefix(format!("[{connections}/secondary/{:?}]", _addr));
+                        pb.set_message("connected");
+                        pb.tick();
+                        _ = c.insert(pb.clone());
+                        Some(pb)
+                    };
+
+                    let service = services(
+                        self.cluster_id.as_str(),
+                        self.groups.clone(),
+                        self.storage.clone(),
+                        self.sasl_config.clone()
+                    )?;
+
+                    set.spawn(async move {
+                        match service.serve(c, stream).await {
+                            Err(Error::Io(ref io))
+                                if io.kind() == ErrorKind::UnexpectedEof
+                                    || io.kind() == ErrorKind::BrokenPipe
+                                    || io.kind() == ErrorKind::ConnectionReset => {}
+                            Err(error) => {
+                                error!(?error);
+                            },
+                            Ok(response) => {
+                                debug!(?response)
+                            }
+                        }
+                        if let Some(ref pb) = pb {
+                            pb.finish_and_clear();
+                        }
+                    });
+                }
+
+                // Accept from primary listener
                 Ok((stream, addr)) = listener.accept() => {
 
                     let mut c = Context::default();
